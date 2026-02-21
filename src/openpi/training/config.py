@@ -747,28 +747,31 @@ _CONFIGS = [
     ema_decay=None,
     ),
     TrainConfig(
-        name="pi05_kuavo_armhand_26d",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=10,
-            discrete_state_input=False,
+    name="pi05_kuavo_armhand_26d_full_finetune",
+    model=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=10,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b",
+        action_expert_variant="gemma_300m",
+    ),
+    data=LeRobotKuavoArmHand26DDataConfig(
+        repo_id="/home/sensethreat/lab_mimic/VLA_IL/capstone-vla/dataset_tools/data/pourLeftCereal/Lusmse/pourLeftCereal",
+        assets=AssetsConfig(
+            assets_dir="/home/sensethreat/lab_mimic/VLA_IL/capstone-vla/dataset_tools/data/pourLeftCereal/Lusmse/pourLeftCereal",
+            asset_id="kuavoV4Pro",
         ),
-        data=LeRobotKuavoArmHand26DDataConfig(
-            repo_id="your_hf_username/your_dataset_repo",
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
-                asset_id="kuavoV4Pro_armhand26d",  # can be any label you want
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=10_000,
-        batch_size=2,
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    num_train_steps=2_000,   # for a fast smoke test first
+    batch_size=32,
+    freeze_filter=None, # full finetuning
+    ema_decay=None,
     ),
     #
     # Inference Aloha configs.
     #
-    
     TrainConfig(
         name="pi0_aloha",
         model=pi0_config.Pi0Config(),
