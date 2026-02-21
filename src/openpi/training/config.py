@@ -13,6 +13,9 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import numpy as np
+import torch
+
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -33,6 +36,37 @@ ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
 
+
+
+
+@dataclasses.dataclass(frozen=True)
+class EnsureNumpyImages:
+    """Convert torch tensors in data['image'] dict into numpy uint8 arrays for PIL."""
+
+    def __call__(self, data: dict) -> dict:
+        if "image" not in data:
+            return data
+
+        out = {}
+        for k, v in data["image"].items():
+            # v can be torch.Tensor or numpy already, maybe shape [H,W,C] or [C,H,W]
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            # If channel-first, convert to HWC
+            if isinstance(v, np.ndarray) and v.ndim == 3 and v.shape[0] in (1, 3) and v.shape[-1] not in (1, 3):
+                v = np.transpose(v, (1, 2, 0))
+            # PIL likes uint8
+            if isinstance(v, np.ndarray) and v.dtype != np.uint8:
+                # if it's float 0..1, scale; if already 0..255 float, just cast
+                vmax = float(v.max()) if v.size else 0.0
+                if vmax <= 1.0:
+                    v = (v * 255.0).clip(0, 255)
+                v = v.astype(np.uint8)
+
+            out[k] = v
+
+        data["image"] = out
+        return data
 
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
@@ -461,6 +495,130 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+"""
+Note on action dimensions:
+Kuavo V4 Pro has 7 joints for each arm (14 total) and 6 joints for each hand (12 total), 
+resulting in a total of 26 dimensions for the arms and hands. 
+The remaining dimensions correspond to the legs and neck, which we are not using for our tasks, 
+so we slice them out to focus on the relevant action dimensions.  
+"""
+
+ARM_HAND_IDX = tuple(list(range(0, 13)) + list(range(22, 35)))  # 26 dims
+
+
+@dataclasses.dataclass(frozen=True)
+class SliceStateAndActions:
+    idx: tuple[int, ...]
+
+    def __call__(self, batch: dict) -> dict:
+        batch["state"] = batch["state"][..., self.idx]
+        batch["actions"] = batch["actions"][..., self.idx]
+        return batch
+    
+@dataclasses.dataclass(frozen=True)
+class AddImageMask:
+    keys: tuple[str, ...]
+
+    def __call__(self, data: dict) -> dict:
+        img = data.get("image", {})
+        # each entry must be shape [B] or scalar-broadcastable
+        # We'll make a scalar True/False; batching will stack it correctly.
+        data["image_mask"] = {k: np.array(k in img and img[k] is not None, dtype=np.bool_) for k in self.keys}
+        return data
+    
+
+
+@dataclasses.dataclass(frozen=True)
+class PadStateAndActionsToDim:
+    target_dim: int
+
+    def __call__(self, data: dict) -> dict:
+        for key in ("state", "actions"):
+            x = data[key]
+            # x shape: (..., d)
+            d = x.shape[-1]
+            if d == self.target_dim:
+                continue
+            if d > self.target_dim:
+                data[key] = x[..., : self.target_dim]
+                continue
+            pad_width = [(0, 0)] * x.ndim
+            pad_width[-1] = (0, self.target_dim - d)
+            data[key] = np.pad(x, pad_width, mode="constant", constant_values=0)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotKuavoArmHand26DDataConfig(DataConfigFactory):
+    """
+    KuavoV4Pro LeRobot dataset:
+    - 3 cameras
+    - absolute joint positions/actions
+    - slice 44D -> 26D (arms+hands)
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # Prompt: you baked a string column named "task"
+                        # "task": "prompt",
+                        "prompt": "task",
+
+                        # Images: pack into a single dict called "images"
+                        "image": {
+                            "base_0_rgb": "observation.images.ego_view",
+                            "left_wrist_0_rgb": "observation.images.left_wrist_view",
+                            "right_wrist_0_rgb": "observation.images.right_wrist_view",
+                        },
+
+                        # State + action
+                        "state": "observation.state",   # 44D in dataset
+                        "actions": "action",            # 44D in dataset
+                    }
+                )
+            ]
+        )
+
+        # Slice BEFORE any tokenization/padding happens
+        data_transforms = _transforms.Group(
+            inputs=[
+                SliceStateAndActions(ARM_HAND_IDX),
+                PadStateAndActionsToDim(32),
+            ],
+            outputs=[],
+        )
+
+        IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+
+        model_transforms = _transforms.Group(
+            inputs=[
+                _transforms.InjectDefaultPrompt(None),
+                EnsureNumpyImages(),
+                _transforms.ResizeImages(224, 224),
+                AddImageMask(IMAGE_KEYS),
+                _transforms.TokenizePrompt(
+                    _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                    discrete_state_input=getattr(model_config, "discrete_state_input", False),
+                ),
+                _transforms.PadStatesAndActions(model_config.action_dim),
+            ],
+        )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # IMPORTANT: your LeRobot parquet column is "action"
+            action_sequence_keys=("action",),
+            # We are providing "prompt" directly via repack, so don't rely on dataset "task" semantics.
+            prompt_from_task=False,
+        )
+
+
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -558,9 +716,59 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    TrainConfig(
+    name="pi05_kuavo_armhand_26d_lora",
+    model=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=10,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ),
+    data=LeRobotKuavoArmHand26DDataConfig(
+        repo_id="/home/sensethreat/lab_mimic/VLA_IL/capstone-vla/dataset_tools/data/pourLeftCereal/Lusmse/pourLeftCereal",
+        assets=AssetsConfig(
+            assets_dir="/home/sensethreat/lab_mimic/VLA_IL/capstone-vla/dataset_tools/data/pourLeftCereal/Lusmse/pourLeftCereal",
+            asset_id="kuavoV4Pro",
+        ),
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    num_train_steps=2_000,   # for a fast smoke test first
+    batch_size=2,
+    freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=10,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ).get_freeze_filter(),
+    ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_kuavo_armhand_26d",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotKuavoArmHand26DDataConfig(
+            repo_id="your_hf_username/your_dataset_repo",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="kuavoV4Pro_armhand26d",  # can be any label you want
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        batch_size=2,
+    ),
     #
     # Inference Aloha configs.
     #
+    
     TrainConfig(
         name="pi0_aloha",
         model=pi0_config.Pi0Config(),
